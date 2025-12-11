@@ -1,0 +1,14 @@
+
+{
+  "name": "multiplayer-backend",
+  "version": "1.0.0",
+  "main": "server.js",
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.13.0",
+    "bad-words": "^3.0.4"
+  },
+  "scripts": {
+    "start": "node server.js"
+  }
+}
