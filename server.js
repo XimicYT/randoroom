@@ -1,6 +1,5 @@
-
 const WebSocket = require('ws');
-const Filter = require('bad-words'); // <--- Import the library
+const Filter = require('bad-words'); // Import censorship library
 
 const port = process.env.PORT || 10000;
 const wss = new WebSocket.Server({ port });
@@ -8,22 +7,21 @@ console.log('WS relay listening on port', port);
 
 const clients = new Map(); // ws -> id
 const playerStates = {};   // id -> {x, y, color, username}
+const chatHistory = [];    // Store last 50 messages
 
 // ==========================================
 // CENSORSHIP CONFIGURATION
 // ==========================================
 const filter = new Filter();
-
-// Optional: Add custom words specific to your game if the library misses them
+// Add custom words here if needed
 filter.addWords('admin', 'mod', 'server'); 
 
 // Helper function to clean text
 function sanitize(text) {
     if (!text) return "";
     try {
-        return filter.clean(text); // This replaces bad words with * automatically
+        return filter.clean(text); // Replaces bad words with *
     } catch (e) {
-        // Fallback in case something weird happens
         return text; 
     }
 }
@@ -50,10 +48,8 @@ wss.on('connection', ws => {
                 clients.set(ws, myId);
 
                 // 1. Sanitize Username
-                // Clean the word and limit length
                 let cleanUsername = sanitize(msg.username).substring(0, 12) || "Player";
-                
-                // Extra check: if the username was purely bad words (now mostly ****), reset it
+                // If username is all asterisks (profanity), reset it
                 if(cleanUsername.includes('***')) cleanUsername = "Guest";
 
                 playerStates[myId] = { 
@@ -63,6 +59,7 @@ wss.on('connection', ws => {
                     username: cleanUsername 
                 };
 
+                // 2. Broadcast Join
                 broadcast({
                     type: "join",
                     id: myId,
@@ -72,6 +69,7 @@ wss.on('connection', ws => {
                     username: cleanUsername
                 }, ws);
 
+                // 3. Send Welcome Packet (Includes Chat History)
                 ws.send(JSON.stringify({
                     type: "welcome",
                     id: myId,
@@ -80,7 +78,7 @@ wss.on('connection', ws => {
                             return { id: pid, ...playerStates[pid] };
                         }
                     }).filter(Boolean),
-                    chat: [] 
+                    chat: chatHistory // Send history to new player
                 }));
             }
             else if(msg.type==="state"){
@@ -99,11 +97,15 @@ wss.on('connection', ws => {
                 }, ws);
             }
             else if(msg.type==="chat"){
-                // 2. Sanitize Chat
+                // 4. Sanitize and Store Chat
                 const cleanMessage = sanitize(msg.message);
-                
-                // Get username from trusted server state
                 const senderName = playerStates[myId] ? playerStates[myId].username : "Unknown";
+
+                const chatObject = { username: senderName, message: cleanMessage };
+                
+                // Save to history
+                chatHistory.push(chatObject);
+                if(chatHistory.length > 50) chatHistory.shift();
 
                 broadcast({ 
                     type:"chat", 
