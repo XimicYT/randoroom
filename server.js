@@ -6,7 +6,7 @@ const wss = new WebSocket.Server({ port });
 console.log('WS relay listening on port', port);
 
 const clients = new Map(); // ws -> id
-const playerStates = {};   // id -> {x, y, color, username}
+const playerStates = {};   // id -> {x, y, color, username, stamina, isExhausted}
 const chatHistory = [];    
 
 // ==========================================
@@ -46,29 +46,30 @@ wss.on('connection', ws => {
                 let cleanUsername = sanitize(msg.username).substring(0, 12).trim() || "Player";
                 if(cleanUsername.includes('***')) cleanUsername = "Guest";
 
-                // 2. CHECK FOR DUPLICATES (NEW LOGIC)
+                // 2. CHECK FOR DUPLICATES
                 const isTaken = Object.values(playerStates).some(p => 
                     p.username.toLowerCase() === cleanUsername.toLowerCase()
                 );
 
                 if (isTaken) {
-                    // Send error specifically to this user
                     ws.send(JSON.stringify({ 
                         type: "error", 
                         message: "Username is already taken." 
                     }));
-                    return; // STOP EXECUTION HERE. Do not let them join.
+                    return; 
                 }
 
-                // If we get here, the name is valid
                 myId = msg.id;
                 clients.set(ws, myId);
 
+                // STORE STATE (Added stamina/isExhausted)
                 playerStates[myId] = { 
                     x: msg.x, 
                     y: msg.y, 
                     color: msg.color,
-                    username: cleanUsername 
+                    username: cleanUsername,
+                    stamina: msg.stamina || 100,
+                    isExhausted: msg.isExhausted || false
                 };
 
                 // Broadcast Join
@@ -78,7 +79,9 @@ wss.on('connection', ws => {
                     x: msg.x,
                     y: msg.y,
                     color: msg.color,
-                    username: cleanUsername
+                    username: cleanUsername,
+                    stamina: msg.stamina || 100,
+                    isExhausted: msg.isExhausted || false
                 }, ws);
 
                 // Send Welcome
@@ -94,10 +97,13 @@ wss.on('connection', ws => {
                 }));
             }
             else if(msg.type==="state"){
+                // UPDATE STATE (Added stamina/isExhausted)
                 if(playerStates[msg.id]){
                     playerStates[msg.id].x = msg.x;
                     playerStates[msg.id].y = msg.y;
                     playerStates[msg.id].color = msg.color;
+                    playerStates[msg.id].stamina = msg.stamina;
+                    playerStates[msg.id].isExhausted = msg.isExhausted;
                 }
 
                 broadcast({
@@ -105,7 +111,9 @@ wss.on('connection', ws => {
                     id: msg.id,
                     x: msg.x,
                     y: msg.y,
-                    color: msg.color
+                    color: msg.color,
+                    stamina: msg.stamina,         // <--- Relay
+                    isExhausted: msg.isExhausted  // <--- Relay
                 }, ws);
             }
             else if(msg.type==="chat"){
@@ -130,7 +138,6 @@ wss.on('connection', ws => {
 
     ws.on('close', () => {
         const id = clients.get(ws);
-        // Only broadcast leave if they actually finished joining (id exists)
         if (id && playerStates[id]) {
             const leftUsername = playerStates[id].username;
             delete playerStates[id];
