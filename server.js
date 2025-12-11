@@ -1,5 +1,5 @@
 const WebSocket = require('ws');
-const Filter = require('bad-words'); // Import censorship library
+const Filter = require('bad-words'); 
 
 const port = process.env.PORT || 10000;
 const wss = new WebSocket.Server({ port });
@@ -7,20 +7,18 @@ console.log('WS relay listening on port', port);
 
 const clients = new Map(); // ws -> id
 const playerStates = {};   // id -> {x, y, color, username}
-const chatHistory = [];    // Store last 50 messages
+const chatHistory = [];    
 
 // ==========================================
 // CENSORSHIP CONFIGURATION
 // ==========================================
 const filter = new Filter();
-// Add custom words here if needed
 filter.addWords('admin', 'mod', 'server'); 
 
-// Helper function to clean text
 function sanitize(text) {
     if (!text) return "";
     try {
-        return filter.clean(text); // Replaces bad words with *
+        return filter.clean(text); 
     } catch (e) {
         return text; 
     }
@@ -44,13 +42,27 @@ wss.on('connection', ws => {
             const msg = JSON.parse(data);
 
             if(msg.type==="join"){
+                // 1. Sanitize Username
+                let cleanUsername = sanitize(msg.username).substring(0, 12).trim() || "Player";
+                if(cleanUsername.includes('***')) cleanUsername = "Guest";
+
+                // 2. CHECK FOR DUPLICATES (NEW LOGIC)
+                const isTaken = Object.values(playerStates).some(p => 
+                    p.username.toLowerCase() === cleanUsername.toLowerCase()
+                );
+
+                if (isTaken) {
+                    // Send error specifically to this user
+                    ws.send(JSON.stringify({ 
+                        type: "error", 
+                        message: "Username is already taken." 
+                    }));
+                    return; // STOP EXECUTION HERE. Do not let them join.
+                }
+
+                // If we get here, the name is valid
                 myId = msg.id;
                 clients.set(ws, myId);
-
-                // 1. Sanitize Username
-                let cleanUsername = sanitize(msg.username).substring(0, 12) || "Player";
-                // If username is all asterisks (profanity), reset it
-                if(cleanUsername.includes('***')) cleanUsername = "Guest";
 
                 playerStates[myId] = { 
                     x: msg.x, 
@@ -59,7 +71,7 @@ wss.on('connection', ws => {
                     username: cleanUsername 
                 };
 
-                // 2. Broadcast Join
+                // Broadcast Join
                 broadcast({
                     type: "join",
                     id: myId,
@@ -69,7 +81,7 @@ wss.on('connection', ws => {
                     username: cleanUsername
                 }, ws);
 
-                // 3. Send Welcome Packet (Includes Chat History)
+                // Send Welcome
                 ws.send(JSON.stringify({
                     type: "welcome",
                     id: myId,
@@ -78,7 +90,7 @@ wss.on('connection', ws => {
                             return { id: pid, ...playerStates[pid] };
                         }
                     }).filter(Boolean),
-                    chat: chatHistory // Send history to new player
+                    chat: chatHistory
                 }));
             }
             else if(msg.type==="state"){
@@ -97,13 +109,11 @@ wss.on('connection', ws => {
                 }, ws);
             }
             else if(msg.type==="chat"){
-                // 4. Sanitize and Store Chat
                 const cleanMessage = sanitize(msg.message);
                 const senderName = playerStates[myId] ? playerStates[myId].username : "Unknown";
 
                 const chatObject = { username: senderName, message: cleanMessage };
                 
-                // Save to history
                 chatHistory.push(chatObject);
                 if(chatHistory.length > 50) chatHistory.shift();
 
@@ -120,11 +130,12 @@ wss.on('connection', ws => {
 
     ws.on('close', () => {
         const id = clients.get(ws);
-        const leftUsername = playerStates[id] ? playerStates[id].username : "Unknown";
-
+        // Only broadcast leave if they actually finished joining (id exists)
+        if (id && playerStates[id]) {
+            const leftUsername = playerStates[id].username;
+            delete playerStates[id];
+            broadcast({ type:"leave", id, username: leftUsername });
+        }
         clients.delete(ws);
-        delete playerStates[id];
-        
-        if(id) broadcast({ type:"leave", id, username: leftUsername });
     });
 });
