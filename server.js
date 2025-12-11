@@ -5,14 +5,18 @@ const port = process.env.PORT || 10000;
 const wss = new WebSocket.Server({ port });
 console.log('WS relay listening on port', port);
 
-const clients = new Map(); // ws -> id
-const playerStates = {};   // id -> {x, y, color, username, stamina, isExhausted, partyId}
+const clients = new Map(); 
+const playerStates = {};   
 const chatHistory = [];    
-const parties = {};        // partyId -> { leaderId, members: [id] }
-const invites = {};        // targetId -> [partyId]
+const parties = {};        
+const invites = {};        
+const inviteCooldowns = {}; // Stores timestamps: "senderId_targetId" -> time
+
+const MAX_PARTY_SIZE = 10;
+const INVITE_COOLDOWN = 15000; // 15 seconds
 
 // ==========================================
-// CENSORSHIP
+// CONFIG
 // ==========================================
 const filter = new Filter();
 filter.addWords('admin', 'mod', 'server'); 
@@ -22,9 +26,6 @@ function sanitize(text) {
     try { return filter.clean(text); } catch (e) { return text; }
 }
 
-// ==========================================
-// BROADCAST HELPERS
-// ==========================================
 function broadcast(msg, except=null){
     const raw = JSON.stringify(msg);
     for(const client of wss.clients){
@@ -50,11 +51,10 @@ function handlePartyCommand(ws, playerId, command, arg) {
     const pState = playerStates[playerId];
     if (!pState) return;
 
-    // 1. CREATE / INVITE
+    // --- 1. INVITE ---
     if (command === "invite") {
         if (!arg) return sendTo(playerId, { type: "error", message: "Usage: /party invite [username]" });
         
-        // Find target
         let targetId = null;
         for (const pid in playerStates) {
             if (playerStates[pid].username.toLowerCase() === arg.toLowerCase()) {
@@ -62,8 +62,17 @@ function handlePartyCommand(ws, playerId, command, arg) {
                 break;
             }
         }
+        
         if (!targetId) return sendTo(playerId, { type: "error", message: "User not found." });
         if (targetId === playerId) return sendTo(playerId, { type: "error", message: "You cannot invite yourself." });
+
+        // Check Cooldown
+        const cooldownKey = `${playerId}_${targetId}`;
+        const now = Date.now();
+        if (inviteCooldowns[cooldownKey] && now - inviteCooldowns[cooldownKey] < INVITE_COOLDOWN) {
+            const timeLeft = Math.ceil((INVITE_COOLDOWN - (now - inviteCooldowns[cooldownKey])) / 1000);
+            return sendTo(playerId, { type: "error", message: `Wait ${timeLeft}s before inviting them again.` });
+        }
 
         // Create party if not exists
         let partyId = pState.partyId;
@@ -71,52 +80,62 @@ function handlePartyCommand(ws, playerId, command, arg) {
             partyId = 'party-' + Math.random().toString(36).substr(2, 9);
             parties[partyId] = { leaderId: playerId, members: [playerId] };
             pState.partyId = partyId;
-            // Notify creator
+            // Force state update to creator so they see their own party status
+            sendTo(playerId, { type: "state", id: playerId, ...pState }); 
             sendTo(playerId, { type: "chat", username: "System", message: "Party created.", scope: "party" });
         }
 
-        // Check if leader
-        if (parties[partyId].leaderId !== playerId) {
-            return sendTo(playerId, { type: "error", message: "Only the party leader can invite." });
-        }
+        const party = parties[partyId];
+        if (party.leaderId !== playerId) return sendTo(playerId, { type: "error", message: "Only the party leader can invite." });
+        if (party.members.length >= MAX_PARTY_SIZE) return sendTo(playerId, { type: "error", message: "Party is full (Max 10)." });
+        if (party.members.includes(targetId)) return sendTo(playerId, { type: "error", message: "Player is already in your party." });
 
         // Send Invite
         if (!invites[targetId]) invites[targetId] = [];
         invites[targetId].push(partyId);
+        inviteCooldowns[cooldownKey] = now; // Set cooldown
         
+        // High visibility invite message
         sendTo(targetId, { 
             type: "chat", 
             username: "System", 
-            message: `<b>${pState.username}</b> invited you to a party. Type <b>/party accept</b> to join.` 
+            message: `<span style="color:#00ff00; font-weight:bold; font-size:14px;">💌 ${pState.username} invited you to a party!</span><br>Type <b>/party accept</b> or <b>/party decline</b>.` 
         });
         sendTo(playerId, { type: "chat", username: "System", message: `Invite sent to ${arg}.`, scope: "party" });
     }
 
-    // 2. ACCEPT
+    // --- 2. ACCEPT ---
     else if (command === "accept") {
         if (!invites[playerId] || invites[playerId].length === 0) {
             return sendTo(playerId, { type: "error", message: "No pending invites." });
         }
         
-        const targetPartyId = invites[playerId].pop(); // Get last invite
+        const targetPartyId = invites[playerId].pop();
         const party = parties[targetPartyId];
         
         if (!party) return sendTo(playerId, { type: "error", message: "Party no longer exists." });
+        if (party.members.length >= MAX_PARTY_SIZE) return sendTo(playerId, { type: "error", message: "Party is full." });
 
-        // Leave current party if in one
         if (pState.partyId) leaveParty(playerId);
 
-        // Join new
         party.members.push(playerId);
         pState.partyId = targetPartyId;
 
-        // Notify Party
         party.members.forEach(mid => {
-            sendTo(mid, { type: "chat", username: "System", message: `${pState.username} has joined the party!`, scope: "party" });
+            sendTo(mid, { type: "chat", username: "System", message: `<b>${pState.username}</b> joined the party!`, scope: "party" });
         });
     }
 
-    // 3. LEAVE
+    // --- 3. DECLINE ---
+    else if (command === "decline") {
+        if (!invites[playerId] || invites[playerId].length === 0) {
+            return sendTo(playerId, { type: "error", message: "No invites to decline." });
+        }
+        invites[playerId].pop(); // Remove invite
+        sendTo(playerId, { type: "chat", username: "System", message: "Invite declined." });
+    }
+
+    // --- 4. LEAVE ---
     else if (command === "leave") {
         if (pState.partyId) {
             leaveParty(playerId);
@@ -126,13 +145,13 @@ function handlePartyCommand(ws, playerId, command, arg) {
         }
     }
 
-    // 4. KICK
+    // --- 5. KICK ---
     else if (command === "kick") {
         if (!pState.partyId) return sendTo(playerId, { type: "error", message: "You are not in a party." });
         const party = parties[pState.partyId];
         if (party.leaderId !== playerId) return sendTo(playerId, { type: "error", message: "Only leader can kick." });
+        if (!arg) return sendTo(playerId, { type: "error", message: "Usage: /party kick [username]" });
 
-        // Find target ID by name
         let targetId = null;
         for (const mid of party.members) {
             if (playerStates[mid].username.toLowerCase() === arg.toLowerCase()) {
@@ -142,13 +161,36 @@ function handlePartyCommand(ws, playerId, command, arg) {
         }
 
         if (!targetId) return sendTo(playerId, { type: "error", message: "Member not found in party." });
-        if (targetId === playerId) return sendTo(playerId, { type: "error", message: "Use /party leave to leave." });
+        if (targetId === playerId) return sendTo(playerId, { type: "error", message: "You cannot kick yourself." });
 
         leaveParty(targetId);
         sendTo(targetId, { type: "chat", username: "System", message: "You were kicked from the party." });
         
         party.members.forEach(mid => {
             sendTo(mid, { type: "chat", username: "System", message: `${arg} was kicked.`, scope: "party" });
+        });
+    }
+
+    // --- 6. LIST ---
+    else if (command === "list") {
+        if (!pState.partyId) return sendTo(playerId, { type: "error", message: "You are not in a party." });
+        const party = parties[pState.partyId];
+        
+        let msg = `<b>Party Members (${party.members.length}/10):</b><br>`;
+        party.members.forEach(mid => {
+            const memberName = playerStates[mid].username;
+            const isLeader = (mid === party.leaderId) ? " (Leader)" : "";
+            msg += `- ${memberName}${isLeader}<br>`;
+        });
+        
+        sendTo(playerId, { type: "chat", username: "System", message: msg, scope: "party" });
+    }
+
+    // --- 7. UNKNOWN COMMAND ---
+    else {
+        sendTo(playerId, { 
+            type: "error", 
+            message: `Unknown party command: '${command}'. <br>Try: invite, accept, decline, leave, kick, list.` 
         });
     }
 }
@@ -162,11 +204,12 @@ function leaveParty(playerId) {
     party.members = party.members.filter(id => id !== playerId);
     pState.partyId = null;
 
-    // If empty, delete
+    // Send state update specifically to the leaver so their client knows they aren't in a party
+    sendTo(playerId, { type: "state", id: playerId, partyId: null, ...pState });
+
     if (party.members.length === 0) {
         delete parties[pid];
     } else {
-        // If leader left, assign new leader
         if (party.leaderId === playerId) {
             party.leaderId = party.members[0];
             const newLeaderName = playerStates[party.leaderId].username;
@@ -174,7 +217,6 @@ function leaveParty(playerId) {
                 sendTo(mid, { type: "chat", username: "System", message: `${newLeaderName} is now the leader.`, scope: "party" });
             });
         }
-        // Notify others
         party.members.forEach(mid => {
             sendTo(mid, { type: "chat", username: "System", message: `${pState.username} left the party.`, scope: "party" });
         });
@@ -192,11 +234,9 @@ wss.on('connection', ws => {
             const msg = JSON.parse(data);
 
             if(msg.type==="join"){
-                // Sanitize
                 let cleanUsername = sanitize(msg.username).substring(0, 12).trim() || "Player";
                 if(cleanUsername.includes('***')) cleanUsername = "Guest";
 
-                // Duplicate Check
                 const isTaken = Object.values(playerStates).some(p => 
                     p.username.toLowerCase() === cleanUsername.toLowerCase()
                 );
@@ -237,7 +277,7 @@ wss.on('connection', ws => {
                 broadcast({
                     type: "state", id: msg.id, x: msg.x, y: msg.y, color: msg.color,
                     stamina: msg.stamina, isExhausted: msg.isExhausted,
-                    partyId: playerStates[msg.id].partyId // Broadcast party ID so clients know who is in party
+                    partyId: playerStates[msg.id].partyId
                 }, ws);
             }
             else if(msg.type==="chat"){
@@ -245,29 +285,25 @@ wss.on('connection', ws => {
                 const senderName = playerStates[myId] ? playerStates[myId].username : "Unknown";
                 const pState = playerStates[myId];
 
-                // CHECK FOR COMMANDS
+                // COMMANDS
                 if (cleanMessage.startsWith('/party')) {
                     const parts = cleanMessage.split(' ');
                     const cmd = parts[1] ? parts[1].toLowerCase() : "";
                     const arg = parts[2] || "";
                     handlePartyCommand(ws, myId, cmd, arg);
-                    return; // Don't broadcast command
+                    return; 
                 }
 
-                // CHECK FOR PARTY CHAT
+                // PARTY CHAT
                 if (msg.scope === "party") {
                     if (pState && pState.partyId && parties[pState.partyId]) {
-                        // Only send to members
                         parties[pState.partyId].members.forEach(mid => {
                             sendTo(mid, { 
-                                type:"chat", 
-                                username: senderName, 
-                                message: cleanMessage,
-                                scope: "party"
+                                type:"chat", username: senderName, message: cleanMessage, scope: "party"
                             });
                         });
                     } else {
-                        sendTo(myId, { type: "error", message: "You are not in a party." });
+                        sendTo(myId, { type: "error", message: "You are not in a party. Switch tab to Global." });
                     }
                 } 
                 // PUBLIC CHAT
@@ -286,7 +322,6 @@ wss.on('connection', ws => {
     ws.on('close', () => {
         const id = clients.get(ws);
         if (id && playerStates[id]) {
-            // Handle leaving party on disconnect
             leaveParty(id);
             const leftUsername = playerStates[id].username;
             delete playerStates[id];
