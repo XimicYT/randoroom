@@ -8,7 +8,7 @@ console.log('WS relay listening on port', port);
 const clients = new Map(); 
 const playerStates = {};   
 const chatHistory = [];    
-const parties = {}; // partyId -> { leaderId, members: [], chatHistory: [], gameData: null }
+const parties = {}; 
 const invites = {};        
 const inviteCooldowns = {}; 
 
@@ -16,14 +16,26 @@ const MAX_PARTY_SIZE = 10;
 const INVITE_COOLDOWN = 15000; 
 
 // ==========================================
-// CONFIG
+// CONFIG & SECURITY
 // ==========================================
 const filter = new Filter();
 filter.addWords('admin', 'mod', 'server'); 
 
+// 1. Filter Bad Words
 function sanitize(text) {
     if (!text) return "";
     try { return filter.clean(text); } catch (e) { return text; }
+}
+
+// 2. Escape HTML (PREVENTS CODE EXECUTION)
+function escapeHtml(text) {
+    if (!text) return "";
+    return text
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
 }
 
 function broadcast(msg, except=null){
@@ -44,8 +56,27 @@ function sendTo(playerId, msg) {
     }
 }
 
+function broadcastState() {
+    Object.keys(playerStates).forEach(pid => {
+        const p = playerStates[pid];
+        let isLeader = false;
+        if (p.partyId && parties[p.partyId] && parties[p.partyId].leaderId === pid) isLeader = true;
+
+        const msg = {
+            type: "state",
+            id: pid,
+            x: p.x, y: p.y, color: p.color,
+            stamina: p.stamina, isExhausted: p.isExhausted,
+            partyId: p.partyId,
+            isPartyLeader: isLeader,
+            isInfected: p.isInfected 
+        };
+        broadcast(msg);
+    });
+}
+
 // ==========================================
-// PARTY GAME LOGIC
+// GAME LOGIC (INFECTION)
 // ==========================================
 function handleGameCommand(ws, playerId, command, arg) {
     const pState = playerStates[playerId];
@@ -61,7 +92,6 @@ function handleGameCommand(ws, playerId, command, arg) {
         if (party.gameData && party.gameData.active) return sendTo(playerId, { type: "error", message: "Game already in progress." });
         if (party.members.length < 2) return sendTo(playerId, { type: "error", message: "Need at least 2 players in party." });
 
-        // Reset Player States
         party.members.forEach(mid => {
             if (playerStates[mid]) {
                 playerStates[mid].isInfected = false;
@@ -69,11 +99,9 @@ function handleGameCommand(ws, playerId, command, arg) {
             }
         });
 
-        // Pick Alpha Zombie
         const alphaId = party.members[Math.floor(Math.random() * party.members.length)];
         if (playerStates[alphaId]) playerStates[alphaId].isInfected = true;
 
-        // Init Game Data
         party.gameData = {
             active: true,
             type: 'infection',
@@ -205,7 +233,6 @@ function handlePartyCommand(ws, playerId, command, arg) {
         if (party.leaderId !== playerId) return sendTo(playerId, { type: "error", message: "Only leader can invite." });
         if (party.members.length >= MAX_PARTY_SIZE) return sendTo(playerId, { type: "error", message: "Party full." });
         
-        // LOCK INVITES DURING GAME
         if (party.gameData && party.gameData.active) {
             return sendTo(playerId, { type: "error", message: "Cannot invite players while a game is active!" });
         }
@@ -305,33 +332,13 @@ function leaveParty(playerId) {
         party.members.forEach(mid => sendTo(mid, { type: "chat", username: "System", message: `${pState.username} left.`, scope: "party" }));
     }
     
-    // Leadership update broadcast
     if (parties[pid]) {
         broadcastState();
     }
 }
 
-function broadcastState() {
-    Object.keys(playerStates).forEach(pid => {
-        const p = playerStates[pid];
-        let isLeader = false;
-        if (p.partyId && parties[p.partyId] && parties[p.partyId].leaderId === pid) isLeader = true;
-
-        const msg = {
-            type: "state",
-            id: pid,
-            x: p.x, y: p.y, color: p.color,
-            stamina: p.stamina, isExhausted: p.isExhausted,
-            partyId: p.partyId,
-            isPartyLeader: isLeader,
-            isInfected: p.isInfected 
-        };
-        broadcast(msg);
-    });
-}
-
 // ==========================================
-// WEBSOCKET
+// WEBSOCKET HANDLERS
 // ==========================================
 wss.on('connection', ws => {
     let myId = null;
@@ -341,7 +348,11 @@ wss.on('connection', ws => {
             const msg = JSON.parse(data);
 
             if(msg.type==="join"){
+                // Sanitize Bad Words
                 let cleanUsername = sanitize(msg.username).substring(0, 14).trim() || "Player";
+                // Escape HTML Chars (Prevent XSS)
+                cleanUsername = escapeHtml(cleanUsername);
+                
                 if(cleanUsername.includes('***')) cleanUsername = "Guest";
 
                 const isTaken = Object.values(playerStates).some(p => p.username.toLowerCase() === cleanUsername.toLowerCase());
@@ -382,7 +393,10 @@ wss.on('connection', ws => {
                 handleTag(myId, msg.targetId);
             }
             else if(msg.type==="chat"){
-                const cleanMessage = sanitize(msg.message);
+                // 1. Sanitize (Bad words)
+                let cleanMessage = sanitize(msg.message);
+                // 2. Escape HTML (Security)
+                cleanMessage = escapeHtml(cleanMessage);
                 
                 if (cleanMessage.startsWith('/party')) {
                     const parts = cleanMessage.split(' ');
