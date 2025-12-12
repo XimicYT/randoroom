@@ -79,8 +79,7 @@ function handlePartyCommand(ws, playerId, command, arg) {
             parties[partyId] = { leaderId: playerId, members: [playerId], chatHistory: [] };
             pState.partyId = partyId;
             
-            // Broadcast state so borders/tags update
-            broadcastState(); 
+            broadcast({ type: "state", id: playerId, ...pState });
             sendTo(playerId, { type: "chat", username: "System", message: "Party created.", scope: "party" });
         }
 
@@ -118,7 +117,7 @@ function handlePartyCommand(ws, playerId, command, arg) {
         party.members.push(playerId);
         pState.partyId = targetPartyId;
 
-        broadcastState(); 
+        broadcast({ type: "state", id: playerId, ...pState });
         sendTo(playerId, { type: "party_history", messages: party.chatHistory });
 
         party.members.forEach(mid => {
@@ -200,65 +199,35 @@ function leaveParty(playerId) {
     if (!pid || !parties[pid]) return;
 
     const party = parties[pid];
-    
-    // Remove player from array
     party.members = party.members.filter(id => id !== playerId);
     pState.partyId = null;
 
     sendTo(playerId, { type: "party_clear" });
+    broadcast({ type: "state", id: playerId, ...pState });
 
-    // If party is empty, delete it
     if (party.members.length === 0) {
         delete parties[pid];
     } else {
-        // LEADERSHIP TRANSFER
-        // If the leader left, the new leader is the person at index 0.
-        // Since we use push() to add members, index 0 is always the "oldest" member.
         if (party.leaderId === playerId) {
             party.leaderId = party.members[0];
             const newLeaderName = playerStates[party.leaderId].username;
-            
             party.members.forEach(mid => {
-                sendTo(mid, { type: "chat", username: "System", message: `<b>${newLeaderName}</b> is now the Party Leader.`, scope: "party" });
+                sendTo(mid, { type: "chat", username: "System", message: `${newLeaderName} is now the leader.`, scope: "party" });
             });
         }
-        
         party.members.forEach(mid => {
             sendTo(mid, { type: "chat", username: "System", message: `${pState.username} left the party.`, scope: "party" });
         });
     }
     
-    broadcastState(); // Update visuals immediately
-}
-
-// Helper to broadcast state of all players with Leader Flags
-function broadcastState() {
-    for(const [ws, id] of clients.entries()) {
-        if(ws.readyState === WebSocket.OPEN) {
-            // We construct the state message individually? No, standard state is fine.
-            // But we need to ensure the `isPartyLeader` flag is calculated.
-            // Actually, we can just send individual state updates for everyone.
-        }
+    // Broadcast leadership change
+    if (parties[pid]) {
+        broadcast({ 
+            type: "state", 
+            id: parties[pid].leaderId, 
+            ...playerStates[parties[pid].leaderId] 
+        });
     }
-    // Optimization: Just rely on the main loop or force a specific packet?
-    // Let's force a state packet for everyone to everyone.
-    Object.keys(playerStates).forEach(pid => {
-        const p = playerStates[pid];
-        let isLeader = false;
-        if (p.partyId && parties[p.partyId] && parties[p.partyId].leaderId === pid) {
-            isLeader = true;
-        }
-
-        const msg = {
-            type: "state",
-            id: pid,
-            x: p.x, y: p.y, color: p.color,
-            stamina: p.stamina, isExhausted: p.isExhausted,
-            partyId: p.partyId,
-            isPartyLeader: isLeader // <--- NEW FLAG
-        };
-        broadcast(msg);
-    });
 }
 
 // ==========================================
@@ -272,7 +241,8 @@ wss.on('connection', ws => {
             const msg = JSON.parse(data);
 
             if(msg.type==="join"){
-                let cleanUsername = sanitize(msg.username).substring(0, 12).trim() || "Player";
+                // UPDATED: CHAR LIMIT 14
+                let cleanUsername = sanitize(msg.username).substring(0, 14).trim() || "Player";
                 if(cleanUsername.includes('***')) cleanUsername = "Guest";
 
                 const isTaken = Object.values(playerStates).some(p => 
@@ -298,11 +268,9 @@ wss.on('connection', ws => {
                 ws.send(JSON.stringify({
                     type: "welcome", id: myId,
                     peers: Object.keys(playerStates).map(pid => {
-                        // Calculate leadership for initial load
                         let isL = false;
                         const p = playerStates[pid];
                         if (p.partyId && parties[p.partyId] && parties[p.partyId].leaderId === pid) isL = true;
-                        
                         if(pid !== myId) return { id: pid, ...p, isPartyLeader: isL };
                     }).filter(Boolean),
                     chat: chatHistory
@@ -316,7 +284,6 @@ wss.on('connection', ws => {
                     playerStates[msg.id].stamina = msg.stamina;
                     playerStates[msg.id].isExhausted = msg.isExhausted;
                 }
-                // We broadcast this in the loop, but let's do the single broadcast here too
                 let isLeader = false;
                 if (playerStates[msg.id].partyId && parties[playerStates[msg.id].partyId]) {
                     if (parties[playerStates[msg.id].partyId].leaderId === msg.id) isLeader = true;
@@ -326,7 +293,7 @@ wss.on('connection', ws => {
                     type: "state", id: msg.id, x: msg.x, y: msg.y, color: msg.color,
                     stamina: msg.stamina, isExhausted: msg.isExhausted,
                     partyId: playerStates[msg.id].partyId,
-                    isPartyLeader: isLeader // <--- Send flag
+                    isPartyLeader: isLeader
                 }, ws);
             }
             else if(msg.type==="chat"){
@@ -334,7 +301,6 @@ wss.on('connection', ws => {
                 const senderName = playerStates[myId] ? playerStates[myId].username : "Unknown";
                 const pState = playerStates[myId];
 
-                // COMMANDS
                 if (cleanMessage.startsWith('/party')) {
                     const parts = cleanMessage.split(' ');
                     const cmd = parts[1] ? parts[1].toLowerCase() : "";
@@ -343,10 +309,8 @@ wss.on('connection', ws => {
                     return; 
                 }
 
-                // PARTY CHAT
                 if (msg.scope === "party") {
                     if (pState && pState.partyId && parties[pState.partyId]) {
-                        
                         const party = parties[pState.partyId];
                         const chatObj = { type: "chat", username: senderName, message: cleanMessage, scope: "party" };
                         party.chatHistory.push(chatObj);
@@ -359,7 +323,6 @@ wss.on('connection', ws => {
                         sendTo(myId, { type: "error", message: "You are not in a party. Switch tab to Global." });
                     }
                 } 
-                // PUBLIC CHAT
                 else {
                     const chatObject = { username: senderName, message: cleanMessage, scope: "public" };
                     chatHistory.push(chatObject);
@@ -383,3 +346,15 @@ wss.on('connection', ws => {
         clients.delete(ws);
     });
 });
+
+// ==========================================
+// MEMORY CLEANUP
+// ==========================================
+setInterval(() => {
+    const now = Date.now();
+    for (const key in inviteCooldowns) {
+        if (now - inviteCooldowns[key] > INVITE_COOLDOWN) {
+            delete inviteCooldowns[key];
+        }
+    }
+}, 60000);
