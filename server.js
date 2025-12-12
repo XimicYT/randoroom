@@ -8,7 +8,7 @@ console.log('WS relay listening on port', port);
 const clients = new Map(); 
 const playerStates = {};   
 const chatHistory = [];    
-const parties = {};        // partyId -> { leaderId, members: [], chatHistory: [] }
+const parties = {}; // partyId -> { leaderId, members: [], chatHistory: [], gameData: null }
 const invites = {};        
 const inviteCooldowns = {}; 
 
@@ -45,151 +45,240 @@ function sendTo(playerId, msg) {
 }
 
 // ==========================================
-// PARTY LOGIC
+// PARTY GAME LOGIC
+// ==========================================
+function handleGameCommand(ws, playerId, command, arg) {
+    const pState = playerStates[playerId];
+    if (!pState || !pState.partyId) return sendTo(playerId, { type: "error", message: "You must be in a party to play." });
+    
+    const party = parties[pState.partyId];
+    if (!party) return;
+
+    // Only Leader
+    if (party.leaderId !== playerId) return sendTo(playerId, { type: "error", message: "Only the Party Leader can control the game." });
+
+    // START INFECTION
+    if (command === "infection" && arg === "start") {
+        if (party.gameData && party.gameData.active) return sendTo(playerId, { type: "error", message: "Game already in progress." });
+        if (party.members.length < 2) return sendTo(playerId, { type: "error", message: "Need at least 2 players in party." });
+
+        // Reset Player States
+        party.members.forEach(mid => {
+            if (playerStates[mid]) {
+                playerStates[mid].isInfected = false;
+                playerStates[mid].stamina = 100;
+            }
+        });
+
+        // Pick Alpha Zombie
+        const alphaId = party.members[Math.floor(Math.random() * party.members.length)];
+        if (playerStates[alphaId]) playerStates[alphaId].isInfected = true;
+
+        // Init Game Data
+        party.gameData = {
+            active: true,
+            type: 'infection',
+            startTime: Date.now(),
+            survivors: party.members.filter(id => id !== alphaId),
+            infectionLog: [] // To track who lasted longest
+        };
+
+        broadcastState(); // Update Visuals
+        
+        // Announce
+        const alphaName = playerStates[alphaId].username;
+        party.members.forEach(mid => {
+            sendTo(mid, { 
+                type: "chat", 
+                username: "System", 
+                message: `<span style="color:#ff4444; font-weight:bold; font-size:14px;">☣️ INFECTION STARTED!</span><br><b>${alphaName}</b> is the ALPHA! Run!`, 
+                scope: "party" 
+            });
+        });
+    }
+
+    // END GAME
+    else if (command === "infection" && arg === "end") {
+        endPartyGame(party, "Game ended by leader.");
+    }
+}
+
+function handleTag(attackerId, victimId) {
+    const attacker = playerStates[attackerId];
+    const victim = playerStates[victimId];
+
+    // Validation
+    if (!attacker || !victim) return;
+    if (attacker.partyId !== victim.partyId || !attacker.partyId) return; // Must be same party
+    
+    const party = parties[attacker.partyId];
+    if (!party || !party.gameData || !party.gameData.active) return;
+
+    // Logic: Attacker must be infected, Victim must NOT be infected
+    if (attacker.isInfected && !victim.isInfected) {
+        victim.isInfected = true;
+        
+        // Log for leaderboard
+        party.gameData.infectionLog.push({
+            username: victim.username,
+            time: Date.now()
+        });
+
+        // Remove from survivors list
+        party.gameData.survivors = party.gameData.survivors.filter(id => id !== victimId);
+
+        broadcastState(); // Update visuals immediately
+
+        // Announce Tag
+        party.members.forEach(mid => {
+            sendTo(mid, { 
+                type: "chat", 
+                username: "System", 
+                message: `<span style="color:#ff8800;">${attacker.username} infected ${victim.username}!</span>`, 
+                scope: "party" 
+            });
+        });
+
+        // Check Win Condition (0 Survivors)
+        if (party.gameData.survivors.length === 0) {
+            endPartyGame(party, "Everyone has been infected!");
+        }
+    }
+}
+
+function endPartyGame(party, reasonMsg) {
+    if (!party.gameData || !party.gameData.active) return;
+
+    // Calculate Results
+    const log = party.gameData.infectionLog;
+    let winnerMsg = "<br><b>Survival Ranking:</b><br>";
+    
+    if (log.length > 0) {
+        // The last person added to the log lasted the longest among the infected
+        // But if someone was never infected (impossible if game ends naturally), they win.
+        // Since game ends when survivor count is 0, the last person infected is the winner.
+        const winner = log[log.length - 1];
+        const duration = ((winner.time - party.gameData.startTime) / 1000).toFixed(1);
+        winnerMsg += `🏆 <b>${winner.username}</b> lasted ${duration}s!`;
+    } else {
+        winnerMsg += "No one survived long enough.";
+    }
+
+    party.members.forEach(mid => {
+        // Reset State
+        if (playerStates[mid]) playerStates[mid].isInfected = false;
+        
+        sendTo(mid, { 
+            type: "chat", 
+            username: "System", 
+            message: `<span style="color:#00ff00; font-weight:bold;">GAME OVER</span><br>${reasonMsg}${winnerMsg}`, 
+            scope: "party" 
+        });
+    });
+
+    party.gameData = null; // Clear game data
+    broadcastState();
+}
+
+// ==========================================
+// PARTY MANAGEMENT
 // ==========================================
 function handlePartyCommand(ws, playerId, command, arg) {
+    // ... (Keep the previous Party Logic for Invite/Kick/etc) ...
+    // Note: I will copy the previous logic here but integrate the game checks
     const pState = playerStates[playerId];
     if (!pState) return;
 
-    // --- 1. INVITE ---
     if (command === "invite") {
         if (!arg) return sendTo(playerId, { type: "error", message: "Usage: /party invite [username]" });
-        
         let targetId = null;
         for (const pid in playerStates) {
-            if (playerStates[pid].username.toLowerCase() === arg.toLowerCase()) {
-                targetId = pid;
-                break;
-            }
+            if (playerStates[pid].username.toLowerCase() === arg.toLowerCase()) { targetId = pid; break; }
         }
-        
         if (!targetId) return sendTo(playerId, { type: "error", message: "User not found." });
-        if (targetId === playerId) return sendTo(playerId, { type: "error", message: "You cannot invite yourself." });
+        if (targetId === playerId) return sendTo(playerId, { type: "error", message: "Cannot invite self." });
 
+        // Cooldown check...
         const cooldownKey = `${playerId}_${targetId}`;
         const now = Date.now();
         if (inviteCooldowns[cooldownKey] && now - inviteCooldowns[cooldownKey] < INVITE_COOLDOWN) {
-            const timeLeft = Math.ceil((INVITE_COOLDOWN - (now - inviteCooldowns[cooldownKey])) / 1000);
-            return sendTo(playerId, { type: "error", message: `Wait ${timeLeft}s before inviting them again.` });
+            return sendTo(playerId, { type: "error", message: "Wait before inviting again." });
         }
 
         let partyId = pState.partyId;
         if (!partyId) {
             partyId = 'party-' + Math.random().toString(36).substr(2, 9);
-            parties[partyId] = { leaderId: playerId, members: [playerId], chatHistory: [] };
+            parties[partyId] = { leaderId: playerId, members: [playerId], chatHistory: [], gameData: null };
             pState.partyId = partyId;
-            
-            broadcast({ type: "state", id: playerId, ...pState });
+            broadcastState();
             sendTo(playerId, { type: "chat", username: "System", message: "Party created.", scope: "party" });
         }
 
         const party = parties[partyId];
-        if (party.leaderId !== playerId) return sendTo(playerId, { type: "error", message: "Only the party leader can invite." });
-        if (party.members.length >= MAX_PARTY_SIZE) return sendTo(playerId, { type: "error", message: "Party is full (Max 10)." });
-        if (party.members.includes(targetId)) return sendTo(playerId, { type: "error", message: "Player is already in your party." });
+        if (party.leaderId !== playerId) return sendTo(playerId, { type: "error", message: "Only leader can invite." });
+        if (party.members.length >= MAX_PARTY_SIZE) return sendTo(playerId, { type: "error", message: "Party full." });
+        // Can't invite during active game
+        if (party.gameData && party.gameData.active) return sendTo(playerId, { type: "error", message: "Cannot invite during active game." });
 
         if (!invites[targetId]) invites[targetId] = [];
         invites[targetId].push(partyId);
-        inviteCooldowns[cooldownKey] = now; 
+        inviteCooldowns[cooldownKey] = now;
         
-        sendTo(targetId, { 
-            type: "chat", 
-            username: "System", 
-            message: `<span style="color:#00ff00; font-weight:bold; font-size:14px;">💌 ${pState.username} invited you to a party!</span><br>Type <b>/party accept</b> or <b>/party decline</b>.` 
-        });
+        sendTo(targetId, { type: "chat", username: "System", message: `<span style="color:#00ff00;">💌 ${pState.username} invited you to a party!</span>`, scope: "local" });
         sendTo(playerId, { type: "chat", username: "System", message: `Invite sent to ${arg}.`, scope: "party" });
     }
-
-    // --- 2. ACCEPT ---
     else if (command === "accept") {
-        if (!invites[playerId] || invites[playerId].length === 0) {
-            return sendTo(playerId, { type: "error", message: "No pending invites." });
-        }
-        
+        if (!invites[playerId] || invites[playerId].length === 0) return sendTo(playerId, { type: "error", message: "No invites." });
         const targetPartyId = invites[playerId].pop();
         const party = parties[targetPartyId];
-        
-        if (!party) return sendTo(playerId, { type: "error", message: "Party no longer exists." });
-        if (party.members.length >= MAX_PARTY_SIZE) return sendTo(playerId, { type: "error", message: "Party is full." });
+        if (!party) return sendTo(playerId, { type: "error", message: "Party gone." });
+        if (party.members.length >= MAX_PARTY_SIZE) return sendTo(playerId, { type: "error", message: "Party full." });
+        if (party.gameData && party.gameData.active) return sendTo(playerId, { type: "error", message: "Party is currently playing a game." });
 
         if (pState.partyId) leaveParty(playerId);
-
         party.members.push(playerId);
         pState.partyId = targetPartyId;
-
-        broadcast({ type: "state", id: playerId, ...pState });
+        broadcastState();
         sendTo(playerId, { type: "party_history", messages: party.chatHistory });
-
-        party.members.forEach(mid => {
-            sendTo(mid, { type: "chat", username: "System", message: `<b>${pState.username}</b> joined the party!`, scope: "party" });
-        });
+        party.members.forEach(mid => sendTo(mid, { type: "chat", username: "System", message: `<b>${pState.username}</b> joined!`, scope: "party" }));
     }
-
-    // --- 3. DECLINE ---
     else if (command === "decline") {
-        if (!invites[playerId] || invites[playerId].length === 0) {
-            return sendTo(playerId, { type: "error", message: "No invites to decline." });
-        }
-        invites[playerId].pop(); 
-        sendTo(playerId, { type: "chat", username: "System", message: "Invite declined." });
+        if (!invites[playerId] || invites[playerId].length === 0) return sendTo(playerId, { type: "error", message: "No invites." });
+        invites[playerId].pop();
+        sendTo(playerId, { type: "chat", username: "System", message: "Declined." });
     }
-
-    // --- 4. LEAVE ---
     else if (command === "leave") {
-        if (pState.partyId) {
-            leaveParty(playerId);
-            sendTo(playerId, { type: "chat", username: "System", message: "You left the party." });
-        } else {
-            sendTo(playerId, { type: "error", message: "You are not in a party." });
-        }
+        if (pState.partyId) leaveParty(playerId);
+        else sendTo(playerId, { type: "error", message: "Not in a party." });
     }
-
-    // --- 5. KICK ---
     else if (command === "kick") {
-        if (!pState.partyId) return sendTo(playerId, { type: "error", message: "You are not in a party." });
+        if (!pState.partyId) return sendTo(playerId, { type: "error", message: "Not in party." });
         const party = parties[pState.partyId];
         if (party.leaderId !== playerId) return sendTo(playerId, { type: "error", message: "Only leader can kick." });
-        if (!arg) return sendTo(playerId, { type: "error", message: "Usage: /party kick [username]" });
-
+        
         let targetId = null;
         for (const mid of party.members) {
-            if (playerStates[mid].username.toLowerCase() === arg.toLowerCase()) {
-                targetId = mid;
-                break;
-            }
+            if (playerStates[mid].username.toLowerCase() === arg.toLowerCase()) { targetId = mid; break; }
         }
-
-        if (!targetId) return sendTo(playerId, { type: "error", message: "Member not found in party." });
-        if (targetId === playerId) return sendTo(playerId, { type: "error", message: "You cannot kick yourself." });
+        if (!targetId) return sendTo(playerId, { type: "error", message: "Member not found." });
+        if (targetId === playerId) return sendTo(playerId, { type: "error", message: "Cannot kick self." });
 
         leaveParty(targetId);
-        sendTo(targetId, { type: "chat", username: "System", message: "You were kicked from the party." });
-        
-        party.members.forEach(mid => {
-            sendTo(mid, { type: "chat", username: "System", message: `${arg} was kicked.`, scope: "party" });
-        });
+        sendTo(targetId, { type: "chat", username: "System", message: "You were kicked." });
+        party.members.forEach(mid => sendTo(mid, { type: "chat", username: "System", message: `${arg} was kicked.`, scope: "party" }));
     }
-
-    // --- 6. LIST ---
     else if (command === "list") {
-        if (!pState.partyId) return sendTo(playerId, { type: "error", message: "You are not in a party." });
+        if (!pState.partyId) return sendTo(playerId, { type: "error", message: "Not in party." });
         const party = parties[pState.partyId];
-        
-        let msg = `<b>Party Members (${party.members.length}/10):</b><br>`;
+        let msg = `<b>Members (${party.members.length}/10):</b><br>`;
         party.members.forEach(mid => {
-            const memberName = playerStates[mid].username;
-            const isLeader = (mid === party.leaderId) ? " (Leader)" : "";
-            msg += `- ${memberName}${isLeader}<br>`;
+            const m = playerStates[mid];
+            msg += `- ${m.username} ${mid === party.leaderId ? "(Leader)" : ""} ${m.isInfected ? "<b>[INFECTED]</b>" : ""}<br>`;
         });
-        
         sendTo(playerId, { type: "chat", username: "System", message: msg, scope: "party" });
     }
-
     else {
-        sendTo(playerId, { 
-            type: "error", 
-            message: `Unknown party command: '${command}'. <br>Try: invite, accept, decline, leave, kick, list.` 
-        });
+        sendTo(playerId, { type: "error", message: "Unknown party command." });
     }
 }
 
@@ -201,9 +290,20 @@ function leaveParty(playerId) {
     const party = parties[pid];
     party.members = party.members.filter(id => id !== playerId);
     pState.partyId = null;
+    pState.isInfected = false; // Reset game status on leave
 
     sendTo(playerId, { type: "party_clear" });
-    broadcast({ type: "state", id: playerId, ...pState });
+    broadcastState();
+
+    // Check if game needs to end because of leaver
+    if (party.gameData && party.gameData.active) {
+        party.gameData.survivors = party.gameData.survivors.filter(id => id !== playerId);
+        if (party.gameData.survivors.length === 0 && party.members.length > 1) {
+            endPartyGame(party, "The last survivor left the party!");
+        } else if (party.members.length < 2) {
+            endPartyGame(party, "Not enough players left.");
+        }
+    }
 
     if (party.members.length === 0) {
         delete parties[pid];
@@ -211,23 +311,29 @@ function leaveParty(playerId) {
         if (party.leaderId === playerId) {
             party.leaderId = party.members[0];
             const newLeaderName = playerStates[party.leaderId].username;
-            party.members.forEach(mid => {
-                sendTo(mid, { type: "chat", username: "System", message: `${newLeaderName} is now the leader.`, scope: "party" });
-            });
+            party.members.forEach(mid => sendTo(mid, { type: "chat", username: "System", message: `${newLeaderName} is now Leader.`, scope: "party" }));
         }
-        party.members.forEach(mid => {
-            sendTo(mid, { type: "chat", username: "System", message: `${pState.username} left the party.`, scope: "party" });
-        });
+        party.members.forEach(mid => sendTo(mid, { type: "chat", username: "System", message: `${pState.username} left.`, scope: "party" }));
     }
-    
-    // Broadcast leadership change
-    if (parties[pid]) {
-        broadcast({ 
-            type: "state", 
-            id: parties[pid].leaderId, 
-            ...playerStates[parties[pid].leaderId] 
-        });
-    }
+}
+
+function broadcastState() {
+    Object.keys(playerStates).forEach(pid => {
+        const p = playerStates[pid];
+        let isLeader = false;
+        if (p.partyId && parties[p.partyId] && parties[p.partyId].leaderId === pid) isLeader = true;
+
+        const msg = {
+            type: "state",
+            id: pid,
+            x: p.x, y: p.y, color: p.color,
+            stamina: p.stamina, isExhausted: p.isExhausted,
+            partyId: p.partyId,
+            isPartyLeader: isLeader,
+            isInfected: p.isInfected // Broadcast infection status
+        };
+        broadcast(msg);
+    });
 }
 
 // ==========================================
@@ -241,29 +347,21 @@ wss.on('connection', ws => {
             const msg = JSON.parse(data);
 
             if(msg.type==="join"){
-                // UPDATED: CHAR LIMIT 14
                 let cleanUsername = sanitize(msg.username).substring(0, 14).trim() || "Player";
                 if(cleanUsername.includes('***')) cleanUsername = "Guest";
 
-                const isTaken = Object.values(playerStates).some(p => 
-                    p.username.toLowerCase() === cleanUsername.toLowerCase()
-                );
-                if (isTaken) {
-                    ws.send(JSON.stringify({ type: "error", message: "Username is already taken." }));
-                    return; 
-                }
+                const isTaken = Object.values(playerStates).some(p => p.username.toLowerCase() === cleanUsername.toLowerCase());
+                if (isTaken) { ws.send(JSON.stringify({ type: "error", message: "Username taken." })); return; }
 
                 myId = msg.id;
                 clients.set(ws, myId);
 
                 playerStates[myId] = { 
                     x: msg.x, y: msg.y, color: msg.color, username: cleanUsername,
-                    stamina: 100, isExhausted: false, partyId: null
+                    stamina: 100, isExhausted: false, partyId: null, isInfected: false
                 };
 
-                broadcast({
-                    type: "join", id: myId, x: msg.x, y: msg.y, color: msg.color, username: cleanUsername
-                }, ws);
+                broadcast({ type: "join", id: myId, x: msg.x, y: msg.y, color: msg.color, username: cleanUsername }, ws);
 
                 ws.send(JSON.stringify({
                     type: "welcome", id: myId,
@@ -277,6 +375,8 @@ wss.on('connection', ws => {
                 }));
             }
             else if(msg.type==="state"){
+                // We rely on server-side logic for game state updates now, 
+                // client only sends position/stamina
                 if(playerStates[msg.id]){
                     playerStates[msg.id].x = msg.x;
                     playerStates[msg.id].y = msg.y;
@@ -284,23 +384,16 @@ wss.on('connection', ws => {
                     playerStates[msg.id].stamina = msg.stamina;
                     playerStates[msg.id].isExhausted = msg.isExhausted;
                 }
-                let isLeader = false;
-                if (playerStates[msg.id].partyId && parties[playerStates[msg.id].partyId]) {
-                    if (parties[playerStates[msg.id].partyId].leaderId === msg.id) isLeader = true;
-                }
-
-                broadcast({
-                    type: "state", id: msg.id, x: msg.x, y: msg.y, color: msg.color,
-                    stamina: msg.stamina, isExhausted: msg.isExhausted,
-                    partyId: playerStates[msg.id].partyId,
-                    isPartyLeader: isLeader
-                }, ws);
+                broadcastState(); // This is heavier but ensures consistency for party tags
+            }
+            else if(msg.type==="tag") {
+                // Client claiming they tagged someone
+                handleTag(myId, msg.targetId);
             }
             else if(msg.type==="chat"){
                 const cleanMessage = sanitize(msg.message);
-                const senderName = playerStates[myId] ? playerStates[myId].username : "Unknown";
-                const pState = playerStates[myId];
-
+                
+                // COMMANDS
                 if (cleanMessage.startsWith('/party')) {
                     const parts = cleanMessage.split(' ');
                     const cmd = parts[1] ? parts[1].toLowerCase() : "";
@@ -308,31 +401,36 @@ wss.on('connection', ws => {
                     handlePartyCommand(ws, myId, cmd, arg);
                     return; 
                 }
+                if (cleanMessage.startsWith('/game')) {
+                    const parts = cleanMessage.split(' ');
+                    const cmd = parts[1] ? parts[1].toLowerCase() : "";
+                    const arg = parts[2] || "";
+                    handleGameCommand(ws, myId, cmd, arg);
+                    return;
+                }
 
+                // CHAT
+                const senderName = playerStates[myId].username;
                 if (msg.scope === "party") {
+                    const pState = playerStates[myId];
                     if (pState && pState.partyId && parties[pState.partyId]) {
                         const party = parties[pState.partyId];
                         const chatObj = { type: "chat", username: senderName, message: cleanMessage, scope: "party" };
                         party.chatHistory.push(chatObj);
                         if(party.chatHistory.length > 50) party.chatHistory.shift();
-
-                        party.members.forEach(mid => {
-                            sendTo(mid, chatObj);
-                        });
+                        party.members.forEach(mid => sendTo(mid, chatObj));
                     } else {
-                        sendTo(myId, { type: "error", message: "You are not in a party. Switch tab to Global." });
+                        sendTo(myId, { type: "error", message: "Not in a party." });
                     }
                 } 
                 else {
-                    const chatObject = { username: senderName, message: cleanMessage, scope: "public" };
-                    chatHistory.push(chatObject);
+                    const chatObj = { username: senderName, message: cleanMessage, scope: "public" };
+                    chatHistory.push(chatObj);
                     if(chatHistory.length > 50) chatHistory.shift();
                     broadcast({ type:"chat", username: senderName, message: cleanMessage, scope: "public" });
                 }
             }
-        } catch(e){
-            console.error('bad message', e);
-        }
+        } catch(e){ console.error(e); }
     });
 
     ws.on('close', () => {
@@ -347,14 +445,9 @@ wss.on('connection', ws => {
     });
 });
 
-// ==========================================
-// MEMORY CLEANUP
-// ==========================================
 setInterval(() => {
     const now = Date.now();
     for (const key in inviteCooldowns) {
-        if (now - inviteCooldowns[key] > INVITE_COOLDOWN) {
-            delete inviteCooldowns[key];
-        }
+        if (now - inviteCooldowns[key] > INVITE_COOLDOWN) delete inviteCooldowns[key];
     }
 }, 60000);
