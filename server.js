@@ -8,12 +8,12 @@ console.log('WS relay listening on port', port);
 const clients = new Map(); 
 const playerStates = {};   
 const chatHistory = [];    
-const parties = {};        
+const parties = {};        // partyId -> { leaderId, members: [], chatHistory: [] }
 const invites = {};        
-const inviteCooldowns = {}; // Stores timestamps: "senderId_targetId" -> time
+const inviteCooldowns = {}; 
 
 const MAX_PARTY_SIZE = 10;
-const INVITE_COOLDOWN = 15000; // 15 seconds
+const INVITE_COOLDOWN = 15000; 
 
 // ==========================================
 // CONFIG
@@ -66,7 +66,6 @@ function handlePartyCommand(ws, playerId, command, arg) {
         if (!targetId) return sendTo(playerId, { type: "error", message: "User not found." });
         if (targetId === playerId) return sendTo(playerId, { type: "error", message: "You cannot invite yourself." });
 
-        // Check Cooldown
         const cooldownKey = `${playerId}_${targetId}`;
         const now = Date.now();
         if (inviteCooldowns[cooldownKey] && now - inviteCooldowns[cooldownKey] < INVITE_COOLDOWN) {
@@ -74,14 +73,14 @@ function handlePartyCommand(ws, playerId, command, arg) {
             return sendTo(playerId, { type: "error", message: `Wait ${timeLeft}s before inviting them again.` });
         }
 
-        // Create party if not exists
         let partyId = pState.partyId;
         if (!partyId) {
             partyId = 'party-' + Math.random().toString(36).substr(2, 9);
-            parties[partyId] = { leaderId: playerId, members: [playerId] };
+            parties[partyId] = { leaderId: playerId, members: [playerId], chatHistory: [] };
             pState.partyId = partyId;
-            // Force state update to creator so they see their own party status
-            sendTo(playerId, { type: "state", id: playerId, ...pState }); 
+            
+            // Broadcast state so borders/tags update
+            broadcastState(); 
             sendTo(playerId, { type: "chat", username: "System", message: "Party created.", scope: "party" });
         }
 
@@ -90,12 +89,10 @@ function handlePartyCommand(ws, playerId, command, arg) {
         if (party.members.length >= MAX_PARTY_SIZE) return sendTo(playerId, { type: "error", message: "Party is full (Max 10)." });
         if (party.members.includes(targetId)) return sendTo(playerId, { type: "error", message: "Player is already in your party." });
 
-        // Send Invite
         if (!invites[targetId]) invites[targetId] = [];
         invites[targetId].push(partyId);
-        inviteCooldowns[cooldownKey] = now; // Set cooldown
+        inviteCooldowns[cooldownKey] = now; 
         
-        // High visibility invite message
         sendTo(targetId, { 
             type: "chat", 
             username: "System", 
@@ -121,6 +118,9 @@ function handlePartyCommand(ws, playerId, command, arg) {
         party.members.push(playerId);
         pState.partyId = targetPartyId;
 
+        broadcastState(); 
+        sendTo(playerId, { type: "party_history", messages: party.chatHistory });
+
         party.members.forEach(mid => {
             sendTo(mid, { type: "chat", username: "System", message: `<b>${pState.username}</b> joined the party!`, scope: "party" });
         });
@@ -131,7 +131,7 @@ function handlePartyCommand(ws, playerId, command, arg) {
         if (!invites[playerId] || invites[playerId].length === 0) {
             return sendTo(playerId, { type: "error", message: "No invites to decline." });
         }
-        invites[playerId].pop(); // Remove invite
+        invites[playerId].pop(); 
         sendTo(playerId, { type: "chat", username: "System", message: "Invite declined." });
     }
 
@@ -186,7 +186,6 @@ function handlePartyCommand(ws, playerId, command, arg) {
         sendTo(playerId, { type: "chat", username: "System", message: msg, scope: "party" });
     }
 
-    // --- 7. UNKNOWN COMMAND ---
     else {
         sendTo(playerId, { 
             type: "error", 
@@ -201,26 +200,65 @@ function leaveParty(playerId) {
     if (!pid || !parties[pid]) return;
 
     const party = parties[pid];
+    
+    // Remove player from array
     party.members = party.members.filter(id => id !== playerId);
     pState.partyId = null;
 
-    // Send state update specifically to the leaver so their client knows they aren't in a party
-    sendTo(playerId, { type: "state", id: playerId, partyId: null, ...pState });
+    sendTo(playerId, { type: "party_clear" });
 
+    // If party is empty, delete it
     if (party.members.length === 0) {
         delete parties[pid];
     } else {
+        // LEADERSHIP TRANSFER
+        // If the leader left, the new leader is the person at index 0.
+        // Since we use push() to add members, index 0 is always the "oldest" member.
         if (party.leaderId === playerId) {
             party.leaderId = party.members[0];
             const newLeaderName = playerStates[party.leaderId].username;
+            
             party.members.forEach(mid => {
-                sendTo(mid, { type: "chat", username: "System", message: `${newLeaderName} is now the leader.`, scope: "party" });
+                sendTo(mid, { type: "chat", username: "System", message: `<b>${newLeaderName}</b> is now the Party Leader.`, scope: "party" });
             });
         }
+        
         party.members.forEach(mid => {
             sendTo(mid, { type: "chat", username: "System", message: `${pState.username} left the party.`, scope: "party" });
         });
     }
+    
+    broadcastState(); // Update visuals immediately
+}
+
+// Helper to broadcast state of all players with Leader Flags
+function broadcastState() {
+    for(const [ws, id] of clients.entries()) {
+        if(ws.readyState === WebSocket.OPEN) {
+            // We construct the state message individually? No, standard state is fine.
+            // But we need to ensure the `isPartyLeader` flag is calculated.
+            // Actually, we can just send individual state updates for everyone.
+        }
+    }
+    // Optimization: Just rely on the main loop or force a specific packet?
+    // Let's force a state packet for everyone to everyone.
+    Object.keys(playerStates).forEach(pid => {
+        const p = playerStates[pid];
+        let isLeader = false;
+        if (p.partyId && parties[p.partyId] && parties[p.partyId].leaderId === pid) {
+            isLeader = true;
+        }
+
+        const msg = {
+            type: "state",
+            id: pid,
+            x: p.x, y: p.y, color: p.color,
+            stamina: p.stamina, isExhausted: p.isExhausted,
+            partyId: p.partyId,
+            isPartyLeader: isLeader // <--- NEW FLAG
+        };
+        broadcast(msg);
+    });
 }
 
 // ==========================================
@@ -260,7 +298,12 @@ wss.on('connection', ws => {
                 ws.send(JSON.stringify({
                     type: "welcome", id: myId,
                     peers: Object.keys(playerStates).map(pid => {
-                        if(pid !== myId) return { id: pid, ...playerStates[pid] };
+                        // Calculate leadership for initial load
+                        let isL = false;
+                        const p = playerStates[pid];
+                        if (p.partyId && parties[p.partyId] && parties[p.partyId].leaderId === pid) isL = true;
+                        
+                        if(pid !== myId) return { id: pid, ...p, isPartyLeader: isL };
                     }).filter(Boolean),
                     chat: chatHistory
                 }));
@@ -273,11 +316,17 @@ wss.on('connection', ws => {
                     playerStates[msg.id].stamina = msg.stamina;
                     playerStates[msg.id].isExhausted = msg.isExhausted;
                 }
+                // We broadcast this in the loop, but let's do the single broadcast here too
+                let isLeader = false;
+                if (playerStates[msg.id].partyId && parties[playerStates[msg.id].partyId]) {
+                    if (parties[playerStates[msg.id].partyId].leaderId === msg.id) isLeader = true;
+                }
 
                 broadcast({
                     type: "state", id: msg.id, x: msg.x, y: msg.y, color: msg.color,
                     stamina: msg.stamina, isExhausted: msg.isExhausted,
-                    partyId: playerStates[msg.id].partyId
+                    partyId: playerStates[msg.id].partyId,
+                    isPartyLeader: isLeader // <--- Send flag
                 }, ws);
             }
             else if(msg.type==="chat"){
@@ -297,10 +346,14 @@ wss.on('connection', ws => {
                 // PARTY CHAT
                 if (msg.scope === "party") {
                     if (pState && pState.partyId && parties[pState.partyId]) {
-                        parties[pState.partyId].members.forEach(mid => {
-                            sendTo(mid, { 
-                                type:"chat", username: senderName, message: cleanMessage, scope: "party"
-                            });
+                        
+                        const party = parties[pState.partyId];
+                        const chatObj = { type: "chat", username: senderName, message: cleanMessage, scope: "party" };
+                        party.chatHistory.push(chatObj);
+                        if(party.chatHistory.length > 50) party.chatHistory.shift();
+
+                        party.members.forEach(mid => {
+                            sendTo(mid, chatObj);
                         });
                     } else {
                         sendTo(myId, { type: "error", message: "You are not in a party. Switch tab to Global." });
