@@ -8,7 +8,7 @@ console.log('WS relay listening on port', port);
 const clients = new Map(); 
 const playerStates = {};   
 const chatHistory = [];    
-const parties = {}; 
+const parties = {}; // partyId -> { leaderId, members: [], chatHistory: [], gameData: null }
 const invites = {};        
 const inviteCooldowns = {}; 
 
@@ -16,26 +16,14 @@ const MAX_PARTY_SIZE = 10;
 const INVITE_COOLDOWN = 15000; 
 
 // ==========================================
-// CONFIG & SECURITY
+// CONFIG & HELPERS
 // ==========================================
 const filter = new Filter();
 filter.addWords('admin', 'mod', 'server'); 
 
-// 1. Filter Bad Words
 function sanitize(text) {
     if (!text) return "";
     try { return filter.clean(text); } catch (e) { return text; }
-}
-
-// 2. Escape HTML (PREVENTS CODE EXECUTION)
-function escapeHtml(text) {
-    if (!text) return "";
-    return text
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;")
-        .replace(/'/g, "&#039;");
 }
 
 function broadcast(msg, except=null){
@@ -92,6 +80,7 @@ function handleGameCommand(ws, playerId, command, arg) {
         if (party.gameData && party.gameData.active) return sendTo(playerId, { type: "error", message: "Game already in progress." });
         if (party.members.length < 2) return sendTo(playerId, { type: "error", message: "Need at least 2 players in party." });
 
+        // Reset Player States
         party.members.forEach(mid => {
             if (playerStates[mid]) {
                 playerStates[mid].isInfected = false;
@@ -99,9 +88,11 @@ function handleGameCommand(ws, playerId, command, arg) {
             }
         });
 
+        // Pick Alpha Zombie
         const alphaId = party.members[Math.floor(Math.random() * party.members.length)];
         if (playerStates[alphaId]) playerStates[alphaId].isInfected = true;
 
+        // Init Game Data
         party.gameData = {
             active: true,
             type: 'infection',
@@ -348,11 +339,7 @@ wss.on('connection', ws => {
             const msg = JSON.parse(data);
 
             if(msg.type==="join"){
-                // Sanitize Bad Words
                 let cleanUsername = sanitize(msg.username).substring(0, 14).trim() || "Player";
-                // Escape HTML Chars (Prevent XSS)
-                cleanUsername = escapeHtml(cleanUsername);
-                
                 if(cleanUsername.includes('***')) cleanUsername = "Guest";
 
                 const isTaken = Object.values(playerStates).some(p => p.username.toLowerCase() === cleanUsername.toLowerCase());
@@ -393,10 +380,7 @@ wss.on('connection', ws => {
                 handleTag(myId, msg.targetId);
             }
             else if(msg.type==="chat"){
-                // 1. Sanitize (Bad words)
-                let cleanMessage = sanitize(msg.message);
-                // 2. Escape HTML (Security)
-                cleanMessage = escapeHtml(cleanMessage);
+                const cleanMessage = sanitize(msg.message);
                 
                 if (cleanMessage.startsWith('/party')) {
                     const parts = cleanMessage.split(' ');
